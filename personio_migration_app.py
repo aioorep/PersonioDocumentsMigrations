@@ -88,7 +88,7 @@ def get_documents(token, employee_id):
         timeout=30,
     )
     if not resp.ok:
-        return []
+        raise ValueError(f"HTTP {resp.status_code} fetching documents for employee {employee_id}: {resp.text}")
     return resp.json().get("data", [])
 
 
@@ -270,7 +270,11 @@ def migrate():
             for item in matched:
                 src = item["src"]
                 tgt = item["tgt"]
-                documents = get_documents(src_token, src["id"])
+                try:
+                    documents = get_documents(src_token, src["id"])
+                except ValueError as e:
+                    q.put({"type": "doc_error", "name": src["display"], "reason": str(e)})
+                    continue
                 if not documents:
                     q.put({"type": "employee", "name": src["display"], "docs": 0})
                     continue
@@ -809,6 +813,10 @@ HTML = """
           ? `<div class="log-skip">⏭  ${msg.name} — no documents</div>`
           : `<div class="log-emp">👤 ${msg.name} (${msg.docs} doc${msg.docs > 1 ? "s" : ""})</div>`;
         log.innerHTML += text;
+      }
+
+      if (msg.type === "doc_error") {
+        log.innerHTML += `<div class="log-fail">👤 ${msg.name} — ❌ Could not fetch documents: ${msg.reason}</div>`;
       }
 
       if (msg.type === "doc") {
