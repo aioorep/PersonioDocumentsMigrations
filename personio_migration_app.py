@@ -11,10 +11,13 @@ import tempfile
 import threading
 from pathlib import Path
 
+import os
+import secrets
 import requests
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request, session
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 # ── In-memory session state (single-user local app) ──────────────────────────
 state = {}
@@ -135,6 +138,19 @@ def index():
     return render_template_string(HTML)
 
 
+@app.route("/api/saved-credentials", methods=["GET"])
+def saved_credentials():
+    """Return previously saved credentials from the session (secrets masked)."""
+    return jsonify({
+        "src_client_id":     session.get("src_client_id", ""),
+        "src_client_secret": "••••••••" if session.get("src_client_secret") else "",
+        "tgt_client_id":     session.get("tgt_client_id", ""),
+        "tgt_client_secret": "••••••••" if session.get("tgt_client_secret") else "",
+        "emails":            session.get("emails", ""),
+        "has_secrets":       bool(session.get("src_client_secret")),
+    })
+
+
 @app.route("/api/preflight", methods=["POST"])
 def preflight():
     body = request.json
@@ -143,6 +159,12 @@ def preflight():
     tgt_id     = body.get("tgt_client_id", "").strip()
     tgt_secret = body.get("tgt_client_secret", "").strip()
     raw_emails = body.get("emails", "")
+
+    # If user left secret fields as masked placeholder, reuse saved ones
+    if src_secret == "••••••••":
+        src_secret = session.get("src_client_secret", "")
+    if tgt_secret == "••••••••":
+        tgt_secret = session.get("tgt_client_secret", "")
 
     # Parse email list
     target_emails = {
@@ -163,6 +185,13 @@ def preflight():
         tgt_token = authenticate(tgt_id, tgt_secret)
     except Exception as e:
         return jsonify({"error": f"Target account authentication failed: {e}"}), 401
+
+    # ── Save credentials to session for retry convenience ──
+    session["src_client_id"]     = src_id
+    session["src_client_secret"] = src_secret
+    session["tgt_client_id"]     = tgt_id
+    session["tgt_client_secret"] = tgt_secret
+    session["emails"]            = raw_emails
 
     src_employees = get_employees(src_token)
     tgt_employees = get_employees(tgt_token)
@@ -631,6 +660,32 @@ HTML = """
      JavaScript
 ════════════════════════════════════════════════════════ -->
 <script>
+  // ── Load saved credentials on page load ──────────────────────────────────
+  window.addEventListener("DOMContentLoaded", async () => {
+    try {
+      const res  = await fetch("/api/saved-credentials");
+      const data = await res.json();
+      if (data.src_client_id) {
+        document.getElementById("srcClientId").value     = data.src_client_id;
+        document.getElementById("tgtClientId").value     = data.tgt_client_id;
+        document.getElementById("emailList").value       = data.emails;
+        if (data.has_secrets) {
+          document.getElementById("srcClientSecret").value = "••••••••";
+          document.getElementById("tgtClientSecret").value = "••••••••";
+          showSavedBanner();
+        }
+      }
+    } catch(e) { /* silently ignore */ }
+  });
+
+  function showSavedBanner() {
+    const banner = document.createElement("div");
+    banner.className = "alert alert-info";
+    banner.style.marginBottom = "16px";
+    banner.innerHTML = "🔁 <strong>Credentials restored from your last session.</strong> The secret fields are pre-filled — leave them as-is to reuse them, or retype to change.";
+    document.getElementById("step1").insertBefore(banner, document.getElementById("step1").children[1]);
+  }
+
   function setStep(n) {
     [1,2,3].forEach(i => {
       document.getElementById("step" + i).classList.toggle("hidden", i !== n);
