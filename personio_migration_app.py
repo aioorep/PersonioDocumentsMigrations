@@ -82,14 +82,35 @@ def extract_info(emp):
 
 def get_documents(token, employee_id):
     headers = {"Authorization": f"Bearer {token}"}
+
+    # First try: dedicated documents endpoint
     resp = requests.get(
         f"{BASE_URL}/company/employees/{employee_id}/documents",
         headers=headers,
         timeout=30,
     )
-    if not resp.ok:
-        raise ValueError(f"HTTP {resp.status_code} fetching documents for employee {employee_id}: {resp.text}")
-    return resp.json().get("data", [])
+    if resp.ok:
+        return resp.json().get("data", [])
+
+    # Second try: fetch employee with ?includes=documents
+    resp2 = requests.get(
+        f"{BASE_URL}/company/employees/{employee_id}",
+        headers=headers,
+        params={"includes": "documents"},
+        timeout=30,
+    )
+    if resp2.ok:
+        data = resp2.json().get("data", {})
+        attrs = data.get("attributes", {})
+        # Documents may be under attributes.documents or a nested key
+        docs = attrs.get("documents", {})
+        if isinstance(docs, dict):
+            return docs.get("value", [])
+        if isinstance(docs, list):
+            return docs
+        return []
+
+    raise ValueError(f"HTTP {resp.status_code}: {resp.text}")
 
 
 def download_document(token, document, dest_dir):
@@ -236,11 +257,6 @@ def preflight():
         else:
             not_in_tgt.append(src_info)
 
-    # Persist state for the migration step
-    state["src_token"] = src_token
-    state["tgt_token"] = tgt_token
-    state["matched"]   = matched
-
     return jsonify({
         "matched":    matched,
         "not_in_src": not_in_src,
@@ -250,21 +266,74 @@ def preflight():
 
 @app.route("/api/migrate", methods=["GET"])
 def migrate():
-    """SSE stream — sends progress events to the browser."""
+    """SSE stream — sends progress events to the browser.
+    Re-authenticates and re-matches using session-stored credentials
+    so it works correctly even after a process restart on Railway.
+    """
 
-    matched   = state.get("matched", [])
-    src_token = state.get("src_token")
-    tgt_token = state.get("tgt_token")
+    src_id     = session.get("src_client_id", "")
+    src_secret = session.get("src_client_secret", "")
+    tgt_id     = session.get("tgt_client_id", "")
+    tgt_secret = session.get("tgt_client_secret", "")
+    raw_emails = session.get("emails", "")
 
-    if not matched or not src_token or not tgt_token:
+    if not src_id or not src_secret or not tgt_id or not tgt_secret:
         def err():
-            yield "data: " + json.dumps({"type": "error", "message": "No migration data found. Run pre-flight first."}) + "\n\n"
+            yield "data: " + json.dumps({"type": "error", "message": "Session expired. Please go back and run the pre-flight check again."}) + "\n\n"
+        return Response(err(), mimetype="text/event-stream")
+
+    # Re-authenticate
+    try:
+        src_token = authenticate(src_id, src_secret)
+        tgt_token = authenticate(tgt_id, tgt_secret)
+    except Exception as e:
+        def err():
+            yield "data: " + json.dumps({"type": "error", "message": f"Re-authentication failed: {e}"}) + "\n\n"
+        return Response(err(), mimetype="text/event-stream")
+
+    # Re-fetch and re-match employees
+    src_employees = get_employees(src_token)
+    tgt_employees = get_employees(tgt_token)
+
+    target_emails = {
+        e.strip().lower()
+        for line in raw_emails.replace(",", "\n").splitlines()
+        for e in [line.strip()]
+        if e and "@" in e
+    }
+
+    tgt_by_email = {}
+    tgt_by_name  = {}
+    for emp in tgt_employees:
+        info = extract_info(emp)
+        if info["email"]:
+            tgt_by_email[info["email"]] = info
+        if info["full_name"]:
+            tgt_by_name[info["full_name"]] = info
+
+    matched = []
+    for email in target_emails:
+        src_info = next(
+            (extract_info(e) for e in src_employees if extract_info(e)["email"] == email),
+            None,
+        )
+        if src_info is None:
+            continue
+        if email in tgt_by_email:
+            matched.append({"src": src_info, "tgt": tgt_by_email[email]})
+        elif src_info["full_name"] in tgt_by_name:
+            matched.append({"src": src_info, "tgt": tgt_by_name[src_info["full_name"]]})
+
+    if not matched:
+        def err():
+            yield "data: " + json.dumps({"type": "error", "message": "No matched employees found. Please run the pre-flight check again."}) + "\n\n"
         return Response(err(), mimetype="text/event-stream")
 
     q = queue.Queue()
 
     def worker():
         total = success = failed = 0
+        q.put({"type": "info", "message": f"Matched {len(matched)} employee(s). Starting document transfer..."})
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             for item in matched:
@@ -807,6 +876,10 @@ HTML = """
 
     es.onmessage = function(e) {
       const msg = JSON.parse(e.data);
+
+      if (msg.type === "info") {
+        log.innerHTML += `<div class="log-skip">${msg.message}</div>`;
+      }
 
       if (msg.type === "employee") {
         const text = msg.docs === 0
