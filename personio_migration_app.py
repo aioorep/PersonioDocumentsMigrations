@@ -792,8 +792,10 @@ HTML = """
 """
 
 if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 5050))
     print("╔══════════════════════════════════════════════════════╗")
     print("║     Personio Migration App                           ║")
-    print("║     Open http://localhost:5050 in your browser       ║")
+    print(f"║     Open http://localhost:{port} in your browser      ║")
     print("╚══════════════════════════════════════════════════════╝")
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
